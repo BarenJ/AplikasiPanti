@@ -1,0 +1,1870 @@
+// server/server.js
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
+const { open } = require('sqlite');
+const bcrypt = require('bcrypt');
+const multer = require('multer');
+const fs = require('fs');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    let folder = 'public/uploads/';
+    if (file.fieldname === 'photo') {
+      folder += 'photos/';
+    } else if (file.fieldname === 'audio') {
+      folder += 'audio/';
+    }
+
+    // Create directory if it doesn't exist
+    if (!fs.existsSync(folder)) {
+      fs.mkdirSync(folder, { recursive: true });
+    }
+
+    cb(null, folder);
+  },
+  filename: function (req, file, cb) {
+    // Generate unique filename
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    cb(null, file.fieldname + '-' + uniqueSuffix + ext);
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: function (req, file, cb) {
+    // Accept images and audio
+    if (file.fieldname === 'photo') {
+      if (!file.originalname.match(/\.(jpg|jpeg|png|gif)$/)) {
+        return cb(new Error('Hanya file gambar (JPG, PNG, GIF) yang diizinkan'), false);
+      }
+    } else if (file.fieldname === 'audio') {
+      if (!file.originalname.match(/\.(mp3|wav|m4a|ogg)$/)) {
+        return cb(new Error('Hanya file audio (MP3, WAV, M4A, OGG) yang diizinkan'), false);
+      }
+    }
+    cb(null, true);
+  }
+});
+
+const transactionStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    let folder = 'public/uploads/transactions/';
+    // Create directory if it doesn't exist
+    if (!fs.existsSync(folder)) {
+      fs.mkdirSync(folder, { recursive: true });
+    }
+    cb(null, folder);
+  },
+  filename: function (req, file, cb) {
+    // Generate unique filename
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    cb(null, 'proof-' + uniqueSuffix + ext);
+  }
+});
+
+const uploadTransaction = multer({
+  storage: transactionStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: function (req, file, cb) {
+    // Accept images and PDFs
+    if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') {
+      cb(null, true);
+    } else {
+      cb(new Error('Hanya file gambar (JPG, PNG, GIF) dan PDF yang diizinkan'), false);
+    }
+  }
+});
+
+app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+app.use(express.urlencoded({ extended: true }));
+
+// BASIC TEST ENDPOINT 
+app.get('/api/test', (req, res) => {
+  res.json({
+    message: 'Server is working!',
+    timestamp: new Date().toISOString(),
+    database: 'SQLite connected'
+  });
+});
+
+// DASHBOARD STATS 
+app.get('/api/dashboard-stats', async (req, res) => {
+  try {
+    // Get active residents count
+    const residentCount = await db.get(
+      'SELECT COUNT(*) as count FROM residents WHERE status = "Aktif"'
+    );
+
+    // Get today's records count
+    const today = new Date().toISOString().split('T')[0];
+    const todayRecords = await db.get(
+      'SELECT COUNT(*) as count FROM daily_records WHERE DATE(record_datetime) = ?',
+      [today]
+    );
+
+    // Get current month's financials
+    const currentMonth = new Date().toISOString().slice(0, 7);
+    const monthlyFinancials = await db.get(`
+      SELECT 
+        COALESCE(SUM(CASE WHEN dc.type = 'income' THEN t.amount ELSE 0 END), 0) as monthly_income,
+        COALESCE(SUM(CASE WHEN dc.type = 'expense' THEN t.amount ELSE 0 END), 0) as monthly_expense
+      FROM transactions t
+      JOIN donation_categories dc ON t.category_id = dc.id
+      WHERE strftime('%Y-%m', t.transaction_date) = ?
+    `, [currentMonth]);
+
+    res.json({
+      active_residents: residentCount.count || 0,
+      today_records: todayRecords.count || 0,
+      monthly_income: monthlyFinancials.monthly_income || 0,
+      monthly_expense: monthlyFinancials.monthly_expense || 0
+    });
+  } catch (error) {
+    console.error('Error fetching dashboard stats:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// RESIDENTS ENDPOINTS
+// GET all residents
+app.get('/api/residents', async (req, res) => {
+  try {
+    console.log('GET /api/residents - Fetching all residents');
+
+    const { search, status, type } = req.query;
+
+    let query = `
+      SELECT r.*, 
+             rm.room_name,
+             rm.room_type,
+             rm.status as room_status
+      FROM residents r
+      LEFT JOIN rooms rm ON r.room_id = rm.id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (status) {
+      query += ' AND r.status = ?';
+      params.push(status);
+    }
+
+    if (type) {
+      query += ' AND r.gender = ?';
+      params.push(type === 'Opa' ? 'male' : 'female');
+    }
+
+    if (search) {
+      query += ' AND (r.name LIKE ? OR r.resident_id LIKE ?)';
+      params.push(`%${search}%`, `%${search}%`);
+    }
+
+    query += ' ORDER BY r.name';
+
+    const residents = await db.all(query, params);
+    console.log(`Found ${residents.length} residents`);
+
+    res.json(residents);
+  } catch (error) {
+    console.error('Error fetching residents:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ================== TRANSACTIONS API ==================
+
+// GET transactions with filtering
+app.get('/api/transactions', async (req, res) => {
+  try {
+    const { type, month, category_id } = req.query;
+
+    let query = `
+      SELECT t.*, dc.name as category_name, dc.type as transaction_type
+      FROM transactions t
+      JOIN donation_categories dc ON t.category_id = dc.id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (type) {
+      query += ' AND dc.type = ?';
+      params.push(type);
+    }
+
+    if (month) {
+      query += ' AND strftime("%Y-%m", t.transaction_date) = ?';
+      params.push(month);
+    }
+
+    if (category_id) {
+      query += ' AND t.category_id = ?';
+      params.push(category_id);
+    }
+
+    query += ' ORDER BY t.transaction_date DESC';
+
+    const transactions = await db.all(query, params);
+    res.json(transactions);
+  } catch (error) {
+    console.error('Error fetching transactions:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST create new transaction WITH file upload
+app.post('/api/transactions', uploadTransaction.single('attachment'), async (req, res) => {
+  try {
+    const {
+      category_id, amount, transaction_date, source,
+      description, payment_method, reference_number, notes
+    } = req.body;
+
+    // Get category type
+    const category = await db.get('SELECT type FROM donation_categories WHERE id = ?', [category_id]);
+    if (!category) {
+      return res.status(400).json({ error: 'Invalid category' });
+    }
+
+    const prefix = category.type === 'income' ? 'INC' : 'EXP';
+
+    // Generate transaction ID
+    const lastTransaction = await db.get(
+      `SELECT transaction_id FROM transactions WHERE transaction_id LIKE '${prefix}-%' ORDER BY id DESC LIMIT 1`
+    );
+
+    let newNumber = 1;
+    if (lastTransaction) {
+      const lastNum = parseInt(lastTransaction.transaction_id.split('-')[1]);
+      newNumber = lastNum + 1;
+    }
+    const transactionId = `${prefix}-${newNumber.toString().padStart(3, '0')}`;
+
+    // Handle attachment path
+    const attachmentPath = req.file ? `/uploads/transactions/${req.file.filename}` : null;
+
+    const result = await db.run(`
+      INSERT INTO transactions 
+      (transaction_id, category_id, amount, transaction_date, source, 
+       description, payment_method, reference_number, notes, attachment_path)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      transactionId,
+      category_id,
+      amount,
+      transaction_date,
+      source,
+      description,
+      payment_method || 'cash',
+      reference_number || '',
+      notes || '',
+      attachmentPath
+    ]);
+
+    res.status(201).json({
+      id: result.lastID,
+      transaction_id: transactionId,
+      message: 'Transaction created successfully',
+      attachment_path: attachmentPath
+    });
+  } catch (error) {
+    console.error('Error creating transaction:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST create new resident
+app.post('/api/residents', upload.fields([
+  { name: 'photo', maxCount: 1 },
+  { name: 'audio', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    console.log('📸 POST /api/residents - Creating resident with files');
+
+    const formData = req.body;
+    const files = req.files;
+
+    // Calculate age from birth_date
+    const calculateAge = (birthDate) => {
+      const today = new Date();
+      const birth = new Date(birthDate);
+      let age = today.getFullYear() - birth.getFullYear();
+      const monthDiff = today.getMonth() - birth.getMonth();
+
+      if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) {
+        age--;
+      }
+      return age;
+    };
+
+    // Validate required fields
+    const requiredFields = ['name', 'gender', 'birth_date', 'join_date', 'condition'];
+    for (const field of requiredFields) {
+      if (!formData[field]) {
+        return res.status(400).json({
+          error: `Field ${field} harus diisi`
+        });
+      }
+    }
+
+    // Generate resident ID
+    const lastResident = await db.get(
+      "SELECT resident_id FROM residents WHERE resident_id LIKE 'R-%' ORDER BY id DESC LIMIT 1"
+    );
+
+    let newNumber = 1;
+    if (lastResident) {
+      const lastNum = parseInt(lastResident.resident_id.split('-')[1]);
+      newNumber = lastNum + 1;
+    }
+    const residentId = `R-${newNumber.toString().padStart(3, '0')}`;
+
+    // Calculate age from birth date
+    const age = calculateAge(formData.birth_date);
+
+    // Prepare file paths
+    const photoPath = files.photo ? `/uploads/photos/${files.photo[0].filename}` : null;
+    const audioPath = files.audio ? `/uploads/audio/${files.audio[0].filename}` : null;
+
+    // Start transaction
+    await db.run('BEGIN TRANSACTION');
+
+    try {
+      // Insert resident with all fields
+      const result = await db.run(`
+        INSERT INTO residents (
+          resident_id, name, age, gender, birth_date, birth_place,
+          address, religion, join_date, condition, medical_history,
+          allergies, smoking, alcohol, functional_walking, functional_eating,
+          mental_emotion, mental_consciousness, photo_path, audio_path, room_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        residentId,
+        formData.name,
+        age,
+        formData.gender,
+        formData.birth_date,
+        formData.birth_place || null,
+        formData.address || null,
+        formData.religion || null,
+        formData.join_date,
+        formData.condition,
+        formData.medical_history || null,
+        formData.allergies || null,
+        formData.smoking || null,
+        formData.alcohol || null,
+        formData.functional_walking || null,
+        formData.functional_eating || null,
+        formData.mental_emotion || null,
+        formData.mental_consciousness || null,
+        photoPath,
+        audioPath,
+        formData.room_id || null
+      ]);
+
+      const residentDbId = result.lastID;
+
+      // Parse guardians if provided (as JSON string)
+      let guardians = [];
+      if (formData.guardians) {
+        try {
+          guardians = JSON.parse(formData.guardians);
+        } catch (e) {
+          console.warn('⚠️ Could not parse guardians JSON:', e.message);
+        }
+      }
+
+      // Insert guardians
+      if (guardians && guardians.length > 0) {
+        for (const guardian of guardians) {
+          if (guardian.name && guardian.phone) {
+            await db.run(`
+              INSERT INTO guardians (resident_id, name, id_number, email, phone, relationship, address, is_primary)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `, [
+              residentDbId,
+              guardian.name,
+              guardian.id_number || null,
+              guardian.email || null,
+              guardian.phone,
+              guardian.relationship || null,
+              guardian.address || null,
+              guardian.is_primary ? 1 : 0
+            ]);
+          }
+        }
+      }
+
+      // Insert hematology data if exists
+      if (formData.hemoglobin || formData.leukocyte || formData.erythrocyte) {
+        await db.run(`
+          INSERT INTO health_records (
+            resident_id, record_type, hemoglobin, leukocyte, erythrocyte, 
+            recorded_date, recorded_by
+          ) VALUES (?, 'hematology', ?, ?, ?, ?, ?)
+        `, [
+          residentDbId,
+          formData.hemoglobin || null,
+          formData.leukocyte || null,
+          formData.erythrocyte || null,
+          formData.join_date,
+          'system'
+        ]);
+      }
+
+      // Insert blood sugar data if exists
+      if (formData.blood_sugar_random || formData.blood_sugar_fasting || formData.blood_sugar_two_hour) {
+        await db.run(`
+          INSERT INTO health_records (
+            resident_id, record_type, blood_sugar_random, blood_sugar_fasting, 
+            blood_sugar_two_hour, recorded_date, recorded_by
+          ) VALUES (?, 'blood_sugar', ?, ?, ?, ?, ?)
+        `, [
+          residentDbId,
+          formData.blood_sugar_random || null,
+          formData.blood_sugar_fasting || null,
+          formData.blood_sugar_two_hour || null,
+          formData.join_date,
+          'system'
+        ]);
+      }
+
+      let medications = [];
+      if (formData.medications) {
+        try {
+          medications = JSON.parse(formData.medications);
+        } catch (e) {
+          console.warn('⚠️ Could not parse medications JSON:', e.message);
+        }
+      }
+
+      // Insert medications if provided
+      if (medications && medications.length > 0) {
+        for (const medication of medications) {
+          if (medication.medication_name) {
+            await db.run(`
+        INSERT INTO medications (
+          resident_id, medication_name, dosage, schedule, status, start_date
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `, [
+              residentDbId,
+              medication.medication_name,
+              medication.dosage || null,
+              medication.schedule || null,
+              medication.status || 'Active',
+              formData.join_date
+            ]);
+          }
+        }
+      }
+
+
+      await db.run('COMMIT');
+
+      res.status(201).json({
+        id: residentDbId,
+        resident_id: residentId,
+        photo_path: photoPath,
+        audio_path: audioPath,
+        age_calculated: age,
+        message: 'Data penghuni berhasil disimpan!'
+      });
+
+    } catch (error) {
+      // Rollback transaction on error
+      await db.run('ROLLBACK');
+
+      // Clean up uploaded files if there was an error
+      if (files.photo) {
+        fs.unlinkSync(path.join(__dirname, files.photo[0].path));
+      }
+      if (files.audio) {
+        fs.unlinkSync(path.join(__dirname, files.audio[0].path));
+      }
+
+      throw error;
+    }
+
+  } catch (error) {
+    console.error('❌ Error creating resident:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Database setup
+let db;
+async function initializeDatabase() {
+  try {
+    db = await open({
+      filename: path.join(__dirname, 'nursing_home.db'),
+      driver: sqlite3.Database
+    });
+
+    // Enable foreign keys
+    await db.run('PRAGMA foreign_keys = ON');
+
+    // Create tables if they don't exist
+    await createTables();
+
+    // Insert default data if tables are empty
+    await insertDefaultData();
+
+    // Check database structure
+    await checkDatabaseStructure();
+
+    console.log('✅ Database initialized successfully');
+    return db;
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
+    throw error;
+  }
+}
+
+async function createTables() {
+  try {
+    // Create rooms table first
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS rooms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_name TEXT NOT NULL UNIQUE,
+        room_type TEXT NOT NULL CHECK (room_type IN ('private', 'shared', 'special')),
+        capacity INTEGER NOT NULL DEFAULT 1,
+        current_occupants INTEGER DEFAULT 0,
+        notes TEXT,
+        status TEXT DEFAULT 'available' CHECK (status IN ('available', 'occupied', 'maintenance', 'reserved')),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS residents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resident_id TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        age INTEGER NOT NULL,
+        gender TEXT NOT NULL CHECK (gender IN ('male', 'female')),
+        birth_date TEXT NOT NULL,
+        birth_place TEXT,
+        address TEXT,
+        religion TEXT,
+        join_date TEXT NOT NULL,
+        condition TEXT CHECK (condition IN ('Sehat', 'Cukup Sehat', 'Kurang Sehat')),
+        medical_history TEXT,
+        allergies TEXT,
+        smoking TEXT,
+        alcohol TEXT,
+        functional_walking TEXT,
+        functional_eating TEXT,
+        mental_emotion TEXT,
+        mental_consciousness TEXT,
+        photo_path TEXT,
+        audio_path TEXT,
+        status TEXT DEFAULT 'Aktif' CHECK (status IN ('Aktif', 'Perlu Perhatian', 'Keluar', 'Meninggal')),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // GUARDIANS TABLE
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS guardians (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resident_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        id_number TEXT,
+        email TEXT,
+        phone TEXT NOT NULL,
+        relationship TEXT,
+        address TEXT,
+        is_primary BOOLEAN DEFAULT 0,
+        emergency_contact BOOLEAN DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (resident_id) REFERENCES residents(id) ON DELETE CASCADE
+      )
+    `);
+
+    // HEALTH_RECORDS TABLE (For hematology, blood sugar, etc.)
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS health_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resident_id INTEGER NOT NULL,
+        record_type TEXT NOT NULL CHECK (record_type IN ('hematology', 'blood_sugar', 'blood_pressure', 'general', 'initial')),
+        hemoglobin TEXT,
+        leukocyte TEXT,
+        erythrocyte TEXT,
+        blood_sugar_random TEXT,
+        blood_sugar_fasting TEXT,
+        blood_sugar_two_hour TEXT,
+        systolic INTEGER,
+        diastolic INTEGER,
+        heart_rate INTEGER,
+        temperature REAL,
+        weight REAL,
+        height REAL,
+        bmi REAL,
+        notes TEXT,
+        recorded_date TEXT NOT NULL,
+        recorded_by TEXT DEFAULT 'system',
+        FOREIGN KEY (resident_id) REFERENCES residents(id) ON DELETE CASCADE
+      )
+    `);
+
+    // MEDICATIONS TABLE
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS medications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resident_id INTEGER NOT NULL,
+        medication_name TEXT NOT NULL,
+        dosage TEXT,
+        schedule TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        prescribing_doctor TEXT,
+        pharmacy TEXT,
+        notes TEXT,
+        status TEXT DEFAULT 'Active' CHECK (status IN ('Active', 'Completed', 'Stopped', 'Changed')),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (resident_id) REFERENCES residents(id) ON DELETE CASCADE
+      )
+    `);
+
+    // ACTIVITY_TYPES TABLE
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS activity_types (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        category TEXT CHECK (category IN ('routine', 'medical', 'visit', 'special')),
+        color_code TEXT DEFAULT '#6c757d',
+        icon TEXT DEFAULT 'fa-calendar'
+      )
+    `);
+
+    // DAILY_RECORDS TABLE
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS daily_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resident_id INTEGER NOT NULL,
+        activity_type_id INTEGER NOT NULL,
+        record_datetime TEXT NOT NULL,
+        condition TEXT NOT NULL CHECK (condition IN ('Baik', 'Cukup Baik', 'Kurang Baik')),
+        notes TEXT NOT NULL,
+        recorded_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (resident_id) REFERENCES residents(id) ON DELETE CASCADE,
+        FOREIGN KEY (activity_type_id) REFERENCES activity_types(id)
+      )
+    `);
+
+    // DONATION_CATEGORIES TABLE
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS donation_categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        type TEXT NOT NULL CHECK (type IN ('income', 'expense')),
+        description TEXT
+      )
+    `);
+
+    // TRANSACTIONS TABLE
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        transaction_id TEXT UNIQUE NOT NULL,
+        category_id INTEGER NOT NULL,
+        amount DECIMAL(15,2) NOT NULL,
+        transaction_date TEXT NOT NULL,
+        source TEXT,
+        description TEXT,
+        payment_method TEXT CHECK (payment_method IN ('cash', 'transfer', 'check', 'other')),
+        reference_number TEXT,
+        recorded_by TEXT,
+        notes TEXT,
+        attachment_path TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (category_id) REFERENCES donation_categories(id)
+      )
+    `);
+
+    // USERS TABLE
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('admin', 'staff', 'doctor', 'nurse')),
+        email TEXT,
+        phone TEXT,
+        is_active BOOLEAN DEFAULT 1,
+        last_login TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // VISITORS_LOG TABLE
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS visitors_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resident_id INTEGER NOT NULL,
+        visitor_name TEXT NOT NULL,
+        relationship TEXT,
+        phone TEXT,
+        visit_date TEXT NOT NULL,
+        visit_time TEXT,
+        purpose TEXT,
+        notes TEXT,
+        recorded_by TEXT,
+        FOREIGN KEY (resident_id) REFERENCES residents(id) ON DELETE CASCADE
+      )
+    `);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS rooms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_name TEXT NOT NULL UNIQUE,
+        room_type TEXT NOT NULL CHECK (room_type IN ('private', 'shared', 'special')),
+        capacity INTEGER NOT NULL DEFAULT 1,
+        current_occupants INTEGER DEFAULT 0,
+        notes TEXT,
+        status TEXT DEFAULT 'available' CHECK (status IN ('available', 'occupied', 'maintenance', 'reserved')),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Add room_id column to residents table
+     try {
+      await db.run(`
+        ALTER TABLE residents ADD COLUMN room_id INTEGER REFERENCES rooms(id)
+      `);
+      console.log('✅ Added room_id column to residents table');
+    } catch (alterError) {
+      if (alterError.message.includes('duplicate column name')) {
+        console.log('✅ room_id column already exists in residents table');
+      } else {
+        throw alterError; // Re-throw if it's a different error
+      }
+    }
+
+    // Create indexes for better performance
+    await db.run('CREATE INDEX IF NOT EXISTS idx_residents_name ON residents(name)');
+    await db.run('CREATE INDEX IF NOT EXISTS idx_residents_status ON residents(status)');
+    await db.run('CREATE INDEX IF NOT EXISTS idx_health_records_resident ON health_records(resident_id)');
+    await db.run('CREATE INDEX IF NOT EXISTS idx_health_records_type ON health_records(record_type)');
+    await db.run('CREATE INDEX IF NOT EXISTS idx_medications_resident ON medications(resident_id)');
+    await db.run('CREATE INDEX IF NOT EXISTS idx_guardians_resident ON guardians(resident_id)');
+    await db.run('CREATE INDEX IF NOT EXISTS idx_daily_records_date ON daily_records(record_datetime)');
+    await db.run('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)');
+
+    console.log('✅ Tables created with complete schema');
+  } catch (error) {
+    console.error('❌ Error creating tables:', error);
+    throw error;
+  }
+}
+
+async function insertDefaultData() {
+  try {
+    // Insert default activity types (using INSERT OR IGNORE to avoid duplicates)
+    const activityTypes = [
+      ['Kegiatan Rutin', 'routine', '#007bff', 'fa-calendar-check'],
+      ['Konsumsi Obat', 'medical', '#dc3545', 'fa-pills'],
+      ['Pemeriksaan Medis', 'medical', '#17a2b8', 'fa-stethoscope'],
+      ['Kunjungan Keluarga', 'visit', '#28a745', 'fa-users'],
+      ['Kegiatan Khusus', 'special', '#ffc107', 'fa-star'],
+      ['Makan', 'routine', '#fd7e14', 'fa-utensils'],
+      ['Istirahat', 'routine', '#6f42c1', 'fa-bed'],
+      ['Fisioterapi', 'medical', '#20c997', 'fa-hands-helping'],
+      ['Konseling', 'medical', '#e83e8c', 'fa-comments']
+    ];
+
+    for (const [name, category, color_code, icon] of activityTypes) {
+      await db.run(
+        'INSERT OR IGNORE INTO activity_types (name, category, color_code, icon) VALUES (?, ?, ?, ?)',
+        [name, category, color_code, icon]
+      );
+    }
+    console.log('✅ Activity types inserted (duplicates ignored)');
+
+    // Insert default donation categories
+    const donationCategories = [
+      ['Donasi Umum', 'income', 'Donasi dari masyarakat umum'],
+      ['Donasi Keluarga', 'income', 'Donasi dari keluarga penghuni'],
+      ['Donasi Yayasan', 'income', 'Donasi dari yayasan/organisasi'],
+      ['Donasi Perusahaan', 'income', 'Donasi dari perusahaan'],
+      ['Bantuan Pemerintah', 'income', 'Bantuan dari pemerintah'],
+      ['Lainnya (Pemasukan)', 'income', 'Pemasukan lainnya'],
+      ['Medis & Obat-obatan', 'expense', 'Biaya pengobatan dan obat'],
+      ['Makanan & Konsumsi', 'expense', 'Biaya makanan sehari-hari'],
+      ['Gaji Staff', 'expense', 'Gaji pegawai dan perawat'],
+      ['Utilitas', 'expense', 'Listrik, air, gas, internet'],
+      ['Perawatan Gedung', 'expense', 'Perbaikan dan perawatan'],
+      ['Transportasi', 'expense', 'Biaya transportasi'],
+      ['Administrasi', 'expense', 'Biaya administrasi'],
+      ['Lainnya (Pengeluaran)', 'expense', 'Pengeluaran lainnya']
+    ];
+
+    for (const [name, type, description] of donationCategories) {
+      await db.run(
+        'INSERT OR IGNORE INTO donation_categories (name, type, description) VALUES (?, ?, ?)',
+        [name, type, description]
+      );
+    }
+    console.log('✅ Donation categories inserted (duplicates ignored)');
+
+    const defaultRooms = [
+      ['Merpati', 'private', 1, 'Kamar dengan AC dan kamar mandi dalam'],
+      ['Kakatua', 'private', 1, 'Kamar dengan jendela besar dan taman view'],
+      ['Elang', 'private', 1, 'Kamar untuk lansia dengan kebutuhan khusus'],
+      ['Kenari', 'shared', 2, 'Kamar bersama dengan 2 tempat tidur'],
+      ['Cendrawasih', 'shared', 2, 'Kamar bersama dengan fasilitas lengkap'],
+      ['Jalak', 'private', 1, 'Kamar standar dengan ventilasi baik'],
+      ['Kutilang', 'private', 1, 'Kamar nyaman dengan akses mudah'],
+      ['Murai', 'special', 1, 'Kamar untuk perawatan intensif'],
+      ['Pipit', 'shared', 2, 'Kamar ekonomi untuk 2 orang'],
+      ['Perkutut', 'private', 1, 'Kamar dengan akses ke teras']
+    ];
+
+    for (const [room_name, room_type, capacity, notes] of defaultRooms) {
+      await db.run(
+        'INSERT OR IGNORE INTO rooms (room_name, room_type, capacity, notes) VALUES (?, ?, ?, ?)',
+        [room_name, room_type, capacity, notes || '']
+      );
+    }
+    console.log('✅ Default rooms inserted');
+
+    // Check if admin user exists
+    const adminCount = await db.get('SELECT COUNT(*) as count FROM users WHERE username = "admin"');
+    if (adminCount.count === 0) {
+      const hashedPassword = await bcrypt.hash('admin123', 10);
+      await db.run(
+        'INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)',
+        ['admin', hashedPassword, 'Administrator Utama', 'admin', 'admin@pantiwk.com']
+      );
+      console.log('✅ Default admin user created (username: admin, password: admin123)');
+    } else {
+      console.log('✅ Admin user already exists');
+    }
+
+    // Check if demo staff user exists
+    const staffCount = await db.get('SELECT COUNT(*) as count FROM users WHERE username = "staff"');
+    if (staffCount.count === 0) {
+      const hashedPassword = await bcrypt.hash('staff123', 10);
+      await db.run(
+        'INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)',
+        ['staff', hashedPassword, 'Staff Demo', 'staff', 'staff@pantiwk.com']
+      );
+      console.log('✅ Demo staff user created (username: staff, password: staff123)');
+    }
+
+  } catch (error) {
+    console.error('❌ Error inserting default data:', error);
+  }
+}
+
+async function checkDatabaseStructure() {
+  try {
+    console.log('🔍 Checking database structure...');
+
+    // Check if tables exist
+    const tables = await db.all("SELECT name FROM sqlite_master WHERE type='table'");
+    console.log('📊 Database tables:', tables.map(t => t.name).join(', '));
+
+    // Check specific tables
+    const requiredTables = ['residents', 'activity_types', 'daily_records', 'guardians'];
+    for (const table of requiredTables) {
+      const exists = tables.some(t => t.name === table);
+      console.log(`${table}: ${exists ? '✅' : '❌'}`);
+    }
+
+    // Check activity_types data
+    const activityTypesCount = await db.get('SELECT COUNT(*) as count FROM activity_types');
+    console.log(`Activity types count: ${activityTypesCount.count}`);
+
+  } catch (error) {
+    console.error('Error checking database structure:', error);
+  }
+}
+
+// ================== RESIDENTS API ==================
+// GET single resident by ID
+app.get('/api/residents/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`🔍 GET /api/residents/${id} - Fetching resident data`);
+
+    // Get resident basic info
+    const resident = await db.get(`
+      SELECT r.*, 
+            rm.room_name,
+            rm.room_type,
+            rm.capacity as room_capacity,
+            rm.notes as room_notes
+      FROM residents r
+      LEFT JOIN rooms rm ON r.room_id = rm.id
+      WHERE r.id = ?
+    `, [id]);
+    console.log('📄 Resident query result:', resident ? 'Found' : 'Not found');
+
+    if (!resident) {
+      console.log(`❌ Resident with id ${id} not found in database`);
+      return res.status(404).json({
+        error: 'Resident not found',
+        message: `No resident found with ID: ${id}`
+      });
+    }
+
+    console.log(`✅ Found resident: ${resident.name} (ID: ${resident.id})`);
+
+    // Get guardians
+    let guardians = [];
+    try {
+      guardians = await db.all('SELECT * FROM guardians WHERE resident_id = ? ORDER BY is_primary DESC', [id]);
+      console.log(`👥 Found ${guardians.length} guardians for resident ${id}:`, guardians);
+    } catch (guardianError) {
+      console.warn('⚠️ Could not fetch guardians:', guardianError.message);
+      // Continue without guardians
+    }
+
+    // Get medications
+    let medications = [];
+    try {
+      medications = await db.all('SELECT * FROM medications WHERE resident_id = ?', [id]);
+      console.log(`💊 Found ${medications.length} medications for resident ${id}`);
+    } catch (medicationError) {
+      console.warn('⚠️ Could not fetch medications:', medicationError.message);
+    }
+
+    // Get hematology data (latest)
+    let hematology = null;
+    try {
+      hematology = await db.get(
+        `SELECT * FROM health_records 
+         WHERE resident_id = ? AND record_type = 'hematology'
+         ORDER BY recorded_date DESC LIMIT 1`,
+        [id]
+      );
+      console.log('🩸 Hematology data:', hematology ? 'Found' : 'Not found');
+    } catch (hematologyError) {
+      console.warn('⚠️ Could not fetch hematology:', hematologyError.message);
+    }
+
+    // Get blood sugar data (latest)
+    let bloodSugar = null;
+    try {
+      bloodSugar = await db.get(
+        `SELECT * FROM health_records 
+         WHERE resident_id = ? AND record_type = 'blood_sugar'
+         ORDER BY recorded_date DESC LIMIT 1`,
+        [id]
+      );
+      console.log('🩺 Blood sugar data:', bloodSugar ? 'Found' : 'Not found');
+    } catch (bloodSugarError) {
+      console.warn('⚠️ Could not fetch blood sugar:', bloodSugarError.message);
+    }
+
+    // Get recent daily records (last 10)
+    let recentRecords = [];
+    try {
+      recentRecords = await db.all(`
+        SELECT dr.*, at.name as activity_name, at.icon as activity_icon, at.color_code as activity_color
+        FROM daily_records dr
+        JOIN activity_types at ON dr.activity_type_id = at.id
+        WHERE dr.resident_id = ?
+        ORDER BY dr.record_datetime DESC
+        LIMIT 10
+      `, [id]);
+      console.log(`📋 Found ${recentRecords.length} recent records`);
+    } catch (recordsError) {
+      console.warn('⚠️ Could not fetch recent records:', recordsError.message);
+    }
+
+    // Format the response
+    const response = {
+      // Basic info
+      id: resident.id,
+      resident_id: resident.resident_id,
+      name: resident.name,
+      age: resident.age,
+      gender: resident.gender,
+      birthDate: resident.birth_date,
+      birth_place: resident.birth_place,
+      address: resident.address,
+      religion: resident.religion,
+      joinDate: resident.join_date,
+      condition: resident.condition,
+      status: resident.status || 'Aktif',
+      medicalHistory: resident.medical_history,
+      allergies: resident.allergies,
+      smoking: resident.smoking,
+      alcohol: resident.alcohol,
+      functional_walking: resident.functional_walking,
+      functional_eating: resident.functional_eating,
+      mental_emotion: resident.mental_emotion,
+      mental_consciousness: resident.mental_consciousness,
+      photo_path: resident.photo_path,
+      audio_path: resident.audio_path,
+
+      // Room information - ADD THIS SECTION
+      room_id: resident.room_id,
+      room_name: resident.room_name,
+      room_type: resident.room_type,
+      room_capacity: resident.room_capacity,
+      room_notes: resident.room_notes,
+
+      // Arrays
+      guardians: guardians,
+      medications: medications,
+      recent_records: recentRecords,
+
+      // Nested objects for frontend
+      medication: medications.length > 0 ? {
+        status: 'Ya',
+        type: medications[0].medication_name,
+        dosage: medications[0].dosage,
+        schedule: medications[0].schedule
+      } : { status: 'Tidak' },
+
+      hematology: hematology ? {
+        hemoglobin: hematology.hemoglobin,
+        leukocyte: hematology.leukocyte,
+        erythrocyte: hematology.erythrocyte
+      } : null,
+
+      bloodSugar: bloodSugar ? {
+        random: bloodSugar.blood_sugar_random,
+        fasting: bloodSugar.blood_sugar_fasting,
+        twoHour: bloodSugar.blood_sugar_two_hour
+      } : null,
+
+      functional: {
+        walking: resident.functional_walking || 'Mandiri',
+        eating: resident.functional_eating || 'Mandiri'
+      },
+
+      mental: {
+        emotion: resident.mental_emotion || 'Stabil',
+        consciousness: resident.mental_consciousness || 'Compos Mentis'
+      },
+
+      guardian: guardians.length > 0 ? {
+        name: guardians[0].name,
+        idNumber: guardians[0].id_number,
+        email: guardians[0].email,
+        phone: guardians[0].phone,
+        relationship: guardians[0].relationship
+      } : null
+    };
+
+    console.log(`✅ Successfully prepared response for resident: ${resident.name}`);
+    res.json(response);
+
+  } catch (error) {
+    console.error('❌ ERROR in GET /api/residents/:id:', error);
+    console.error('Error stack:', error.stack);
+
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message,
+      code: error.code,
+      ...(process.env.NODE_ENV === 'development' && { stack: error.stack })
+    });
+  }
+});
+
+
+app.get('/api/rooms', async (req, res) => {
+  try {
+    const rooms = await db.all(`
+      SELECT r.*, 
+             COUNT(res.id) as current_occupants,
+             GROUP_CONCAT(res.name, ', ') as resident_names
+      FROM rooms r
+      LEFT JOIN residents res ON r.id = res.room_id
+      GROUP BY r.id
+      ORDER BY r.room_name
+    `);
+
+    // Calculate availability
+    const roomsWithAvailability = rooms.map(room => ({
+      ...room,
+      is_available: room.current_occupants < room.capacity,
+      available_beds: room.capacity - room.current_occupants
+    }));
+
+    res.json(roomsWithAvailability);
+  } catch (error) {
+    console.error('Error fetching rooms:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET available rooms (for assignment)
+app.get('/api/rooms/available', async (req, res) => {
+  try {
+    const availableRooms = await db.all(`
+      SELECT r.*, 
+             COUNT(res.id) as current_occupants
+      FROM rooms r
+      LEFT JOIN residents res ON r.id = res.room_id
+      GROUP BY r.id
+      HAVING current_occupants < r.capacity
+      ORDER BY r.room_name
+    `);
+
+    res.json(availableRooms.map(room => ({
+      ...room,
+      available_beds: room.capacity - room.current_occupants
+    })));
+  } catch (error) {
+    console.error('Error fetching available rooms:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST create new room
+app.post('/api/rooms', async (req, res) => {
+  try {
+    const { room_name, room_type, capacity, notes } = req.body;
+
+    const result = await db.run(`
+      INSERT INTO rooms (room_name, room_type, capacity, notes)
+      VALUES (?, ?, ?, ?)
+    `, [room_name, room_type, capacity, notes || '']);
+
+    res.status(201).json({
+      id: result.lastID,
+      message: 'Room created successfully'
+    });
+  } catch (error) {
+    console.error('Error creating room:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT update room
+app.put('/api/rooms/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { room_name, room_type, capacity, notes, status } = req.body;
+
+    const result = await db.run(`
+      UPDATE rooms 
+      SET room_name = ?, room_type = ?, capacity = ?, notes = ?, status = ?
+      WHERE id = ?
+    `, [room_name, room_type, capacity, notes || '', status || 'available', id]);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    res.json({ message: 'Room updated successfully' });
+  } catch (error) {
+    console.error('Error updating room:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ================== ROOM MANAGEMENT API ==================
+
+// GET all rooms
+app.get('/api/rooms', async (req, res) => {
+  try {
+    const rooms = await db.all(`
+      SELECT r.*, 
+             COUNT(res.id) as current_occupants,
+             GROUP_CONCAT(res.name, ', ') as resident_names
+      FROM rooms r
+      LEFT JOIN residents res ON r.id = res.room_id
+      GROUP BY r.id
+      ORDER BY r.room_name
+    `);
+
+    // Calculate availability
+    const roomsWithAvailability = rooms.map(room => ({
+      ...room,
+      is_available: room.current_occupants < room.capacity,
+      available_beds: room.capacity - room.current_occupants
+    }));
+
+    res.json(roomsWithAvailability);
+  } catch (error) {
+    console.error('Error fetching rooms:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET available rooms (for assignment)
+app.get('/api/rooms/available', async (req, res) => {
+  try {
+    const availableRooms = await db.all(`
+      SELECT r.*, 
+             COUNT(res.id) as current_occupants
+      FROM rooms r
+      LEFT JOIN residents res ON r.id = res.room_id
+      GROUP BY r.id
+      HAVING current_occupants < r.capacity
+      ORDER BY r.room_name
+    `);
+
+    res.json(availableRooms.map(room => ({
+      ...room,
+      available_beds: room.capacity - room.current_occupants
+    })));
+  } catch (error) {
+    console.error('Error fetching available rooms:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST create new room
+app.post('/api/rooms', async (req, res) => {
+  try {
+    const { room_name, room_type, capacity, notes } = req.body;
+
+    const result = await db.run(`
+      INSERT INTO rooms (room_name, room_type, capacity, notes)
+      VALUES (?, ?, ?, ?)
+    `, [room_name, room_type, capacity, notes || '']);
+
+    res.status(201).json({
+      id: result.lastID,
+      message: 'Room created successfully'
+    });
+  } catch (error) {
+    console.error('Error creating room:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT update room
+app.put('/api/rooms/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { room_name, room_type, capacity, notes, status } = req.body;
+
+    const result = await db.run(`
+      UPDATE rooms 
+      SET room_name = ?, room_type = ?, capacity = ?, notes = ?, status = ?
+      WHERE id = ?
+    `, [room_name, room_type, capacity, notes || '', status || 'available', id]);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    res.json({ message: 'Room updated successfully' });
+  } catch (error) {
+    console.error('Error updating room:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE room
+app.delete('/api/rooms/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if room has residents
+    const residentsCount = await db.get(
+      'SELECT COUNT(*) as count FROM residents WHERE room_id = ?',
+      [id]
+    );
+
+    if (residentsCount.count > 0) {
+      return res.status(400).json({
+        error: 'Cannot delete room with assigned residents'
+      });
+    }
+
+    const result = await db.run('DELETE FROM rooms WHERE id = ?', [id]);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    res.json({ message: 'Room deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting room:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Assign room to resident
+app.put('/api/residents/:id/assign-room', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { room_id, previous_room_id } = req.body;
+
+    // Start transaction
+    await db.run('BEGIN TRANSACTION');
+
+    try {
+      // If moving from previous room, decrement its occupant count
+      if (previous_room_id) {
+        await db.run(`
+          UPDATE rooms 
+          SET current_occupants = current_occupants - 1 
+          WHERE id = ?
+        `, [previous_room_id]);
+      }
+
+      // Update resident's room
+      await db.run('UPDATE residents SET room_id = ? WHERE id = ?', [room_id || null, id]);
+
+      // If assigning to new room, increment its occupant count
+      if (room_id) {
+        await db.run(`
+          UPDATE rooms 
+          SET current_occupants = current_occupants + 1 
+          WHERE id = ?
+        `, [room_id]);
+      }
+
+      await db.run('COMMIT');
+
+      res.json({
+        message: room_id ? 'Room assigned successfully' : 'Room assignment removed successfully'
+      });
+    } catch (error) {
+      await db.run('ROLLBACK');
+      throw error;
+    }
+  } catch (error) {
+    console.error('Error assigning room:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get room occupancy report
+app.get('/api/rooms/occupancy-report', async (req, res) => {
+  try {
+    const report = await db.all(`
+      SELECT 
+        r.room_name,
+        r.room_type,
+        r.capacity,
+        COUNT(res.id) as current_occupants,
+        r.capacity - COUNT(res.id) as available_beds,
+        CASE 
+          WHEN COUNT(res.id) = 0 THEN 'empty'
+          WHEN COUNT(res.id) < r.capacity THEN 'partially_occupied'
+          ELSE 'full'
+        END as occupancy_status,
+        GROUP_CONCAT(res.name, ', ') as resident_names
+      FROM rooms r
+      LEFT JOIN residents res ON r.id = res.room_id AND res.status = 'Aktif'
+      GROUP BY r.id
+      ORDER BY r.room_name
+    `);
+
+    res.json(report);
+  } catch (error) {
+    console.error('Error fetching occupancy report:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ================== DAILY RECORDS API ==================
+// Get daily records with filters
+app.get('/api/records', async (req, res) => {
+  try {
+    const { resident_id, date_from, date_to, activity_type_id } = req.query;
+
+    console.log('GET /api/records - Query:', { resident_id, date_from, date_to, activity_type_id });
+
+    let query = `
+      SELECT 
+        dr.*, 
+        r.name as resident_name, 
+        r.gender,
+        CASE 
+          WHEN r.gender = 'male' THEN 'Opa' 
+          ELSE 'Oma' 
+        END as resident_type,
+        at.name as activity_name, 
+        at.icon as activity_icon,
+        at.color_code as activity_color
+      FROM daily_records dr
+      JOIN residents r ON dr.resident_id = r.id
+      LEFT JOIN activity_types at ON dr.activity_type_id = at.id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (resident_id) {
+      query += ' AND dr.resident_id = ?';
+      params.push(resident_id);
+    }
+
+    if (date_from) {
+      query += ' AND DATE(dr.record_datetime) >= ?';
+      params.push(date_from);
+    }
+
+    if (date_to) {
+      query += ' AND DATE(dr.record_datetime) <= ?';
+      params.push(date_to);
+    }
+
+    if (activity_type_id) {
+      query += ' AND dr.activity_type_id = ?';
+      params.push(activity_type_id);
+    }
+
+    query += ' ORDER BY dr.record_datetime DESC';
+
+    console.log('SQL Query:', query);
+    console.log('SQL Params:', params);
+
+    const records = await db.all(query, params);
+    console.log(`Found ${records.length} records`);
+
+    res.json(records);
+  } catch (error) {
+    console.error('❌ Error fetching records:', error);
+    console.error('Error details:', error.message);
+
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message,
+      code: error.code
+    });
+  }
+});
+
+// Create new daily record
+app.post('/api/records', async (req, res) => {
+  try {
+    let { resident_id, activity_type_id, record_datetime, condition, notes, recorded_by } = req.body;
+
+    // Ensure record_datetime has seconds if not provided
+    if (record_datetime && record_datetime.length === 16) { // YYYY-MM-DDTHH:MM format
+      record_datetime += ':00'; // Add seconds
+    }
+
+    console.log('POST /api/records - Creating record:', {
+      resident_id, activity_type_id, record_datetime, condition
+    });
+
+    const result = await db.run(`
+      INSERT INTO daily_records 
+      (resident_id, activity_type_id, record_datetime, condition, notes, recorded_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [resident_id, activity_type_id, record_datetime, condition, notes, recorded_by || 'System']);
+
+    console.log('✅ Record created with ID:', result.lastID);
+
+    res.status(201).json({
+      id: result.lastID,
+      message: 'Record created successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error creating record:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// Get financial summary
+app.get('/api/financial-summary', async (req, res) => {
+  try {
+    const { year } = req.query;
+    const currentYear = year || new Date().getFullYear().toString();
+
+    // Get totals
+    const summary = await db.get(`
+      SELECT 
+        COALESCE(SUM(CASE WHEN dc.type = 'income' THEN t.amount ELSE 0 END), 0) as total_income,
+        COALESCE(SUM(CASE WHEN dc.type = 'expense' THEN t.amount ELSE 0 END), 0) as total_expense,
+        COALESCE(SUM(CASE WHEN dc.type = 'income' THEN t.amount ELSE -t.amount END), 0) as balance
+      FROM transactions t
+      JOIN donation_categories dc ON t.category_id = dc.id
+      WHERE strftime('%Y', t.transaction_date) = ?
+    `, [currentYear]);
+
+    // Get monthly breakdown
+    const monthly = await db.all(`
+      SELECT 
+        strftime('%Y-%m', t.transaction_date) as month,
+        COALESCE(SUM(CASE WHEN dc.type = 'income' THEN t.amount ELSE 0 END), 0) as income,
+        COALESCE(SUM(CASE WHEN dc.type = 'expense' THEN t.amount ELSE 0 END), 0) as expense
+      FROM transactions t
+      JOIN donation_categories dc ON t.category_id = dc.id
+      WHERE strftime('%Y', t.transaction_date) = ?
+      GROUP BY strftime('%Y-%m', t.transaction_date)
+      ORDER BY month DESC
+    `, [currentYear]);
+
+    res.json({
+      summary,
+      monthly_breakdown: monthly,
+      current_year: currentYear
+    });
+  } catch (error) {
+    console.error('Error fetching financial summary:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ================== UTILITY ENDPOINTS ==================
+// Get activity types
+app.get('/api/activity-types', async (req, res) => {
+  try {
+    console.log('GET /api/activity-types - Fetching activity types');
+    const activityTypes = await db.all('SELECT * FROM activity_types ORDER BY name');
+    console.log(`Found ${activityTypes.length} activity types`);
+    res.json(activityTypes);
+  } catch (error) {
+    console.error('Error fetching activity types:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// Get donation categories
+app.get('/api/donation-categories', async (req, res) => {
+  try {
+    const categories = await db.all('SELECT * FROM donation_categories ORDER BY type, name');
+    res.json(categories);
+  } catch (error) {
+    console.error('Error fetching donation categories:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ================== USER MANAGEMENT API ==================
+
+// GET all users (admin only)
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await db.all(`
+      SELECT id, username, full_name, role, email, phone, is_active, 
+             last_login, created_at 
+      FROM users 
+      ORDER BY role, username
+    `);
+    res.json(users);
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST create new user (admin only)
+app.post('/api/users', async (req, res) => {
+  try {
+    const { username, password, full_name, role, email, phone } = req.body;
+
+    // Check if username already exists
+    const existingUser = await db.get(
+      'SELECT id FROM users WHERE username = ?',
+      [username]
+    );
+
+    if (existingUser) {
+      return res.status(400).json({ error: 'Username already exists' });
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const result = await db.run(`
+      INSERT INTO users (username, password_hash, full_name, role, email, phone)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [username, hashedPassword, full_name, role, email, phone]);
+
+    // Get created user without password
+    const newUser = await db.get(`
+      SELECT id, username, full_name, role, email, phone, is_active, created_at
+      FROM users WHERE id = ?
+    `, [result.lastID]);
+
+    res.status(201).json({
+      ...newUser,
+      message: 'User created successfully'
+    });
+  } catch (error) {
+    console.error('Error creating user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE user (admin only)
+app.delete('/api/users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Prevent deleting self
+    if (id === '1') { // Assuming admin ID is 1
+      return res.status(400).json({ error: 'Cannot delete main admin account' });
+    }
+
+    const result = await db.run('DELETE FROM users WHERE id = ?', [id]);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'User deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update login endpoint to use database users
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    // Get user from database
+    const user = await db.get(
+      'SELECT * FROM users WHERE username = ? AND is_active = 1',
+      [username]
+    );
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Compare password
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Update last login
+    await db.run(
+      'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?',
+      [user.id]
+    );
+
+    // Remove password from response
+    const { password_hash, ...userWithoutPassword } = user;
+
+    res.json({
+      user: userWithoutPassword,
+      token: 'demo-token-123', // In production, use JWT
+      message: 'Login successful'
+    });
+  } catch (error) {
+    console.error('Error during login:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Authentication
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    const user = await db.get(
+      'SELECT * FROM users WHERE username = ? AND is_active = 1',
+      [username]
+    );
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Update last login
+    await db.run(
+      'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?',
+      [user.id]
+    );
+
+    // Remove password hash from response
+    const { password_hash, ...userWithoutPassword } = user;
+
+    res.json({
+      user: userWithoutPassword,
+      token: 'dummy-jwt-token-for-now'
+    });
+  } catch (error) {
+    console.error('Error during login:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/users/:id/password', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newPassword } = req.body;
+
+    // Check if user exists
+    const user = await db.get('SELECT id FROM users WHERE id = ?', [id]);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Validate new password
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    }
+
+    // Hash the new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update the password
+    await db.run(
+      'UPDATE users SET password_hash = ? WHERE id = ?',
+      [hashedPassword, id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Password updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating password:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Server Error:', err.stack);
+  res.status(500).json({
+    error: 'Something went wrong!',
+    message: err.message,
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+  });
+});
+
+// DELETE a record
+app.delete('/api/records/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`🗑️ DELETE /api/records/${id} - Deleting record`);
+
+    // First check if record exists
+    const record = await db.get('SELECT * FROM daily_records WHERE id = ?', [id]);
+
+    if (!record) {
+      return res.status(404).json({ error: 'Record not found' });
+    }
+
+    const result = await db.run('DELETE FROM daily_records WHERE id = ?', [id]);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Record not found' });
+    }
+
+    console.log(`✅ Record ID ${id} deleted successfully`);
+
+    res.json({
+      success: true,
+      message: 'Record berhasil dihapus',
+      deleted_id: id
+    });
+
+  } catch (error) {
+    console.error('❌ Error deleting record:', error);
+    res.status(500).json({
+      error: 'Gagal menghapus record',
+      details: error.message
+    });
+  }
+});
+
+// DELETE a transaction (donation)
+app.delete('/api/transactions/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`🗑️ DELETE /api/transactions/${id} - Deleting transaction`);
+
+    // First check if transaction exists
+    const transaction = await db.get('SELECT * FROM transactions WHERE id = ?', [id]);
+
+    if (!transaction) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    const result = await db.run('DELETE FROM transactions WHERE id = ?', [id]);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    if (transaction && transaction.attachment_path) {
+      const filePath = path.join(__dirname, 'public', transaction.attachment_path);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+
+    console.log(`✅ Transaction ${transaction.transaction_id} deleted successfully`);
+
+    res.json({
+      success: true,
+      message: 'Transaksi berhasil dihapus',
+      deleted_id: id,
+      transaction_id: transaction.transaction_id
+    });
+
+  } catch (error) {
+    console.error('❌ Error deleting transaction:', error);
+    res.status(500).json({
+      error: 'Gagal menghapus transaksi',
+      details: error.message
+    });
+  }
+});
+
+// Initialize database and start server
+async function startServer() {
+  try {
+    await initializeDatabase();
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
+      console.log(`📁 Database: nursing_home.db`);
+      console.log(`📊 API endpoints available at http://localhost:${PORT}/api/`);
+      console.log(`🔑 Default login: admin / admin123`);
+    });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down server...');
+  if (db) {
+    await db.close();
+    console.log('✅ Database connection closed');
+  }
+  process.exit(0);
+});
+
+startServer();
