@@ -349,7 +349,7 @@ app.post('/api/residents', upload.fields([
           address, religion, join_date, condition, medical_history,
           allergies, smoking, alcohol, functional_walking, functional_eating,
           mental_emotion, mental_consciousness, photo_path, audio_path, room_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         residentId,
         formData.name,
